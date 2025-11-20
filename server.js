@@ -1,215 +1,124 @@
-// server.js
-import express from "express";
-import crypto from "crypto";
+// Add near top of file (imports)
 import axios from "axios";
-import dotenv from "dotenv";
-import pkg from "pg";
 
-dotenv.config();
-const { Pool } = pkg;
-
-// Environment variables
-const PORT = process.env.PORT || 3000;
-const BAGIBAGI_WEBHOOK_TOKEN = process.env.BAGIBAGI_WEBHOOK_TOKEN;
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
-const DATABASE_URL = process.env.DATABASE_URL;
-
-// Crash on missing secrets
-if (!BAGIBAGI_WEBHOOK_TOKEN) {
-  console.error("❌ Missing BAGIBAGI_WEBHOOK_TOKEN");
-  process.exit(1);
-}
-if (!DATABASE_URL) {
-  console.error("❌ Missing DATABASE_URL");
-  process.exit(1);
-}
-
-// PostgreSQL Pool
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
-});
-
-// Express App
-const app = express();
-app.use(express.json({ limit: "200kb" }));
-
-let pendingDonations = []; // in-memory queue for Roblox
-
-// Signature validation
-function computeSig(body) {
-  return crypto
-    .createHmac("sha256", BAGIBAGI_WEBHOOK_TOKEN)
-    .update(JSON.stringify(body))
-    .digest("hex");
-}
-
-function safeEqual(a, b) {
-  try {
-    const x = Buffer.from(a, "hex");
-    const y = Buffer.from(b, "hex");
-    if (x.length !== y.length) return false;
-    return crypto.timingSafeEqual(x, y);
-  } catch {
-    return false;
-  }
-}
-
-// Extract @username
+// helper: extract @username (returns string or null)
 function extractAtUsername(message) {
-  if (!message) return null;
-  const m = message.match(/@([A-Za-z0-9_]+)/);
+  if (!message || typeof message !== "string") return null;
+  // match @username (Roblox usernames use letters, digits, underscore, and periods; keep it permissive)
+  const m = message.match(/@([A-Za-z0-9_.]{1,20})/);
   return m ? m[1] : null;
 }
 
-// DB UPSERT
-async function upsertDonation({
-  donor_key,
-  roblox_username,
-  bagibagi_name,
-  amount,
-  message,
-  timeISO
-}) {
-  const client = await pool.connect();
+// helper: ask Roblox for displayName (returns { id, name, displayName } or null)
+async function lookupRobloxUsername(username) {
   try {
-    const q = `
-      INSERT INTO bagibagi_leaderboard (
-        donor_key, roblox_username, bagibagi_name,
-        total_rp, last_donation_rp, last_message, last_time
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
-      ON CONFLICT (donor_key) DO UPDATE
-      SET
-        total_rp = bagibagi_leaderboard.total_rp + EXCLUDED.last_donation_rp,
-        last_donation_rp = EXCLUDED.last_donation_rp,
-        last_message = EXCLUDED.last_message,
-        last_time = EXCLUDED.last_time,
-        roblox_username = COALESCE(EXCLUDED.roblox_username, bagibagi_leaderboard.roblox_username),
-        bagibagi_name = COALESCE(EXCLUDED.bagibagi_name, bagibagi_leaderboard.bagibagi_name)
-      RETURNING donor_key, total_rp;
-    `;
-    const vals = [
-      donor_key,
-      roblox_username,
-      bagibagi_name,
-      amount,
-      amount,
-      message,
-      timeISO
-    ];
+    const res = await axios.post(
+      "https://users.roblox.com/v1/usernames/users",
+      { usernames: [username], excludeBannedUsers: true },
+      { headers: { "Content-Type": "application/json" }, timeout: 5000 }
+    );
 
-    const res = await client.query(q, vals);
-    return res.rows[0];
-  } finally {
-    client.release();
+    if (res.data && Array.isArray(res.data.data) && res.data.data.length > 0) {
+      const u = res.data.data[0];
+      // u has { id, name, displayName, ... }
+      return { id: u.id, name: u.name, displayName: u.displayName };
+    }
+  } catch (err) {
+    // don't throw — caller will proceed without displayName
+    console.warn("Roblox lookup failed for", username, err.message || err);
   }
+  return null;
 }
 
-// WEBHOOK — main handler
-app.post("/bagibagi-webhook", async (req, res) => {
+// Replace / update the upsertDonation function with something like this:
+async function upsertDonation(payload) {
+  // payload: { transaction_id, name (bagibagi_name), amount, message, created_at }
+  const donorKey = `user:${payload.roblox_username ?? payload.name ?? "bagibagi:" + payload.transaction_id}`;
+
+  // prefer: if payload includes something identifying (bagibagi provides a name, and we detect @username)
+  const bagibagiName = payload.name || payload.bagibagi_name || null;
+  const amount = Number(payload.amount || 0);
+  const lastMsg = payload.message || null;
+  const lastTime = payload.created_at ? new Date(payload.created_at).toISOString() : new Date().toISOString();
+
+  // extract @username from message if present
+  const atUsername = extractAtUsername(lastMsg);
+
+  // Attempt to reuse cached displayName if a row exists for this donor_key
+  let cached = null;
   try {
-    // 1. Validate signature
-    const theirSig = req.headers["x-bagibagi-signature"] || "";
-    const expected = computeSig(req.body);
+    const sel = await pool.query(`SELECT roblox_username, roblox_display_name FROM donations WHERE donor_key = $1 LIMIT 1`, [donorKey]);
+    if (sel.rows && sel.rows.length > 0) cached = sel.rows[0];
+  } catch (err) {
+    console.warn("DB select cached error:", err.message || err);
+  }
 
-    if (!safeEqual(theirSig, expected)) {
-      console.warn("❌ Invalid signature attempt");
-      return res.status(401).send("Invalid signature");
-    }
+  let robloxUsernameToStore = null;
+  let robloxDisplayNameToStore = null;
+  let robloxUserId = null;
 
-    const payload = req.body;
+  if (atUsername) {
+    // prefer the username from the message
+    robloxUsernameToStore = atUsername;
 
-    // 2. Parse payload
-    const amount = Number(payload.amount) || 0;
-    const bagibagiName = payload.name || "Anonymous";
-    const message = payload.message || "";
-    const timeISO = payload.created_at || new Date().toISOString();
-
-    // 3. Username detection
-    const atUser = extractAtUsername(message);
-
-    let donor_key, roblox_username;
-
-    if (atUser) {
-      donor_key = `user:${atUser.toLowerCase()}`;
-      roblox_username = atUser;
+    // if cached displayName exists for same username, reuse
+    if (cached && cached.roblox_username === robloxUsernameToStore && cached.roblox_display_name) {
+      robloxDisplayNameToStore = cached.roblox_display_name;
     } else {
-      donor_key = `anon:${bagibagiName.toLowerCase().replace(/\s+/g, "_")}`;
+      // lookup Roblox API
+      const info = await lookupRobloxUsername(robloxUsernameToStore);
+      if (info) {
+        robloxDisplayNameToStore = info.displayName || null;
+        robloxUserId = info.id || null;
+      } else {
+        // fallback: store the username but no displayName
+        robloxDisplayNameToStore = null;
+      }
     }
-
-    // 4. DB write
-    const result = await upsertDonation({
-      donor_key,
-      roblox_username,
-      bagibagi_name: bagibagiName,
-      amount,
-      message,
-      timeISO
-    });
-
-    console.log("💾 Stored donation:", result);
-
-    // 5. Add to Roblox queue
-    pendingDonations.push({
-      id: payload.transaction_id,
-      name: bagibagiName,
-      amount,
-      message,
-      created_at: timeISO
-    });
-
-    // 6. Discord forwarding (optional)
-    if (DISCORD_WEBHOOK_URL) {
-      axios.post(DISCORD_WEBHOOK_URL, {
-        embeds: [
-          {
-            title: "💸 New BagiBagi Donation",
-            description: `**${bagibagiName}** donated **Rp ${amount}**\n${message}`,
-            timestamp: timeISO
-          }
-        ]
-      }).catch(() => {});
-    }
-
-    res.send("ok");
-  } catch (err) {
-    console.error("❌ Webhook error:", err);
-    res.status(500).send("server error");
+  } else {
+    // No @username found: keep roblox fields null (we only have bagibagi_name)
+    // Optionally you could attempt to match bagibagi_name -> roblox but that is not reliable
+    robloxUsernameToStore = null;
+    robloxDisplayNameToStore = null;
   }
-});
 
-// Roblox polling endpoint
-app.get("/roblox/latest", (req, res) => {
-  const copy = pendingDonations.slice();
-  pendingDonations = [];
-  res.json(copy);
-});
-
-// Leaderboard API
-app.get("/leaderboard/top", async (req, res) => {
+  // Now perform UPSERT into donations table. Adjust column names if yours differ.
+  // Use integer for amounts (total_rp is expected to be int8 in your DB)
   try {
-    const r = await pool.query(
-      `SELECT donor_key, roblox_username, bagibagi_name,
-              total_rp, last_donation_rp, last_message, last_time
-       FROM bagibagi_leaderboard
-       ORDER BY total_rp DESC
-       LIMIT 10`
-    );
-    res.json(r.rows);
+    // Upsert: insert or update totals
+    // We'll add last_message, last_time, last_donation_rp, bagibagi_name, roblox_username, roblox_display_name
+    const q = `
+      INSERT INTO donations (donor_key, roblox_username, roblox_display_name, bagibagi_name, total_rp, last_donation_rp, last_message, last_time)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (donor_key)
+      DO UPDATE SET
+        roblox_username = COALESCE(EXCLUDED.roblox_username, donations.roblox_username),
+        roblox_display_name = COALESCE(EXCLUDED.roblox_display_name, donations.roblox_display_name),
+        bagibagi_name = COALESCE(EXCLUDED.bagibagi_name, donations.bagibagi_name),
+        total_rp = donations.total_rp + EXCLUDED.last_donation_rp,
+        last_donation_rp = EXCLUDED.last_donation_rp,
+        last_message = EXCLUDED.last_message,
+        last_time = EXCLUDED.last_time
+      RETURNING *;
+    `;
+
+    // If we want to add incoming donation amount to existing total, we need to set total_rp appropriately.
+    // Here we supply total_rp as current donation amount for the EXCLUDED row; the ON CONFLICT uses existing donation.total_rp + EXCLUDED.last_donation_rp
+    const params = [
+      donorKey,
+      robloxUsernameToStore,
+      robloxDisplayNameToStore,
+      bagibagiName,
+      amount,      // used as EXCLUDED.total_rp (will be treated as last_donation_rp for initial insert)
+      amount,      // last_donation_rp
+      lastMsg,
+      lastTime
+    ];
+
+    const res = await pool.query(q, params);
+    return res.rows[0];
   } catch (err) {
-    console.error("❌ Leaderboard error:", err);
-    res.status(500).send("server error");
+    console.error("DB upsert error:", err);
+    throw err;
   }
-});
-
-// Health Check
-app.get("/", (req, res) => {
-  res.send("Bagibagi → Roblox bridge server is running.");
-});
-
-app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
-});
+}
