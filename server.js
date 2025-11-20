@@ -1,4 +1,4 @@
-// server.js
+ // server.js
 // Replace your existing file with this. Uses ESM imports (Node 18+/22+).
 import express from "express";
 import { createHmac } from "crypto";
@@ -180,6 +180,30 @@ app.get("/leaderboard/top", async (req, res) => {
   } catch (err) {
     console.error("[leaderboard] error:", err && err.message ? err.message : err);
     res.status(500).json({ error: "failed" });
+  }
+});
+
+// Return the most recent donation (for real-time popup)
+app.get("/roblox/latest", async (req, res) => {
+  try {
+    const q = `
+      SELECT donor_key, roblox_username, roblox_display_name, bagibagi_name,
+             total_rp, last_donation_rp, last_message, last_time
+      FROM donations
+      ORDER BY last_time DESC
+      LIMIT 1;
+    `;
+
+    const r = await pool.query(q);
+
+    if (r.rows.length > 0) {
+      return res.json(r.rows[0]);
+    } else {
+      return res.json({}); // no donations yet
+    }
+  } catch (err) {
+    console.error("[latest] error:", err.message || err);
+    return res.status(500).json({ error: "failed" });
   }
 });
 
