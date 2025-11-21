@@ -1,4 +1,4 @@
- // server.js
+// server.js
 // Replace your existing file with this. Uses ESM imports (Node 18+/22+).
 import express from "express";
 import { createHmac } from "crypto";
@@ -28,7 +28,6 @@ if (!DATABASE_URL) {
 // Accepts connection string like: postgresql://...:password@host:5432/postgres?sslmode=require
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  // for safety with many providers; Postgres (node-postgres) detects ssl query param, but include fallback:
   ssl: DATABASE_URL && DATABASE_URL.includes("sslmode=require") ? { rejectUnauthorized: false } : undefined,
   max: 20,
   idleTimeoutMillis: 30000,
@@ -54,7 +53,7 @@ function extractAtUsername(message) {
   return m ? m[1] : null;
 }
 
-// Helper: lookup Roblox username -> displayName via Roblox public API
+// Helper: lookup Roblox username -> displayName + id via Roblox public API
 async function lookupRobloxUsername(username) {
   if (!username) return null;
   try {
@@ -73,10 +72,9 @@ async function lookupRobloxUsername(username) {
   return null;
 }
 
-// Upsert donation logic (stores/accumulates totals, caches roblox_display_name)
+// Upsert donation logic (stores/accumulates totals, caches roblox_display_name & roblox_userid)
 async function upsertDonation(payload) {
   // payload fields expected: transaction_id, name (bagibagi_name), amount, message, created_at
-  // Build a stable donor_key; prefer bagibagi's provided identifier if any
   const bagibagiName = payload.name || payload.bagibagi_name || null;
   const amount = Number(payload.amount || 0);
   const lastMsg = payload.message || null;
@@ -85,14 +83,16 @@ async function upsertDonation(payload) {
   // Extract @username from message (if present)
   const atUsername = extractAtUsername(lastMsg);
 
-  // donorKey: if the message included @username we might want to use that as identifier;
-  // otherwise use bagibagi_name + transaction id as fallback
+  // donorKey: prefer username if present, else fallback
   const donorKey = atUsername ? `user:${atUsername}` : (payload.donor_key || `bagibagi:${payload.transaction_id}`);
 
   // Attempt to use cached roblox info if present
   let cached = null;
   try {
-    const sel = await pool.query(`SELECT roblox_username, roblox_display_name FROM donations WHERE donor_key = $1 LIMIT 1`, [donorKey]);
+    const sel = await pool.query(
+      `SELECT roblox_username, roblox_display_name, roblox_userid FROM donations WHERE donor_key = $1 LIMIT 1`,
+      [donorKey]
+    );
     if (sel.rows && sel.rows.length > 0) cached = sel.rows[0];
   } catch (err) {
     console.warn("[upsert] DB select cached error:", err && err.message ? err.message : err);
@@ -100,37 +100,51 @@ async function upsertDonation(payload) {
 
   let robloxUsernameToStore = null;
   let robloxDisplayNameToStore = null;
-  let robloxUserId = null;
+  let robloxUserIdToStore = null;
 
   if (atUsername) {
     robloxUsernameToStore = atUsername;
 
     if (cached && cached.roblox_username === robloxUsernameToStore && cached.roblox_display_name) {
       robloxDisplayNameToStore = cached.roblox_display_name;
+      robloxUserIdToStore = cached.roblox_userid || null;
     } else {
       const info = await lookupRobloxUsername(robloxUsernameToStore);
       if (info) {
         robloxDisplayNameToStore = info.displayName || null;
-        robloxUserId = info.id || null;
+        robloxUserIdToStore = info.id || null;
       } else {
         robloxDisplayNameToStore = null;
+        robloxUserIdToStore = null;
       }
     }
   } else {
     // No @username provided -> keep roblox fields null
     robloxUsernameToStore = null;
     robloxDisplayNameToStore = null;
+    robloxUserIdToStore = null;
   }
 
   // Upsert into donations table: insert first-time, or update existing totals
   try {
     const q = `
-      INSERT INTO donations (donor_key, roblox_username, roblox_display_name, bagibagi_name, total_rp, last_donation_rp, last_message, last_time)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO donations (
+        donor_key,
+        roblox_username,
+        roblox_display_name,
+        roblox_userid,
+        bagibagi_name,
+        total_rp,
+        last_donation_rp,
+        last_message,
+        last_time
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       ON CONFLICT (donor_key)
       DO UPDATE SET
         roblox_username = COALESCE(EXCLUDED.roblox_username, donations.roblox_username),
         roblox_display_name = COALESCE(EXCLUDED.roblox_display_name, donations.roblox_display_name),
+        roblox_userid = COALESCE(EXCLUDED.roblox_userid, donations.roblox_userid),
         bagibagi_name = COALESCE(EXCLUDED.bagibagi_name, donations.bagibagi_name),
         total_rp = donations.total_rp + EXCLUDED.last_donation_rp,
         last_donation_rp = EXCLUDED.last_donation_rp,
@@ -143,6 +157,7 @@ async function upsertDonation(payload) {
       donorKey,
       robloxUsernameToStore,
       robloxDisplayNameToStore,
+      robloxUserIdToStore,
       bagibagiName,
       amount, // initial total for new row
       amount, // last_donation_rp
@@ -170,7 +185,7 @@ app.get("/leaderboard/top", async (req, res) => {
   try {
     const limit = Number(req.query.limit) || 10;
     const q = `
-      SELECT donor_key, bagibagi_name, roblox_username, roblox_display_name, total_rp, last_donation_rp, last_message, last_time
+      SELECT donor_key, bagibagi_name, roblox_username, roblox_display_name, roblox_userid, total_rp, last_donation_rp, last_message, last_time
       FROM donations
       ORDER BY total_rp DESC
       LIMIT $1;
@@ -187,7 +202,7 @@ app.get("/leaderboard/top", async (req, res) => {
 app.get("/roblox/latest", async (req, res) => {
   try {
     const q = `
-      SELECT donor_key, roblox_username, roblox_display_name, bagibagi_name,
+      SELECT donor_key, bagibagi_name, roblox_username, roblox_display_name, roblox_userid,
              total_rp, last_donation_rp, last_message, last_time
       FROM donations
       ORDER BY last_time DESC
